@@ -1,0 +1,1689 @@
+#!/bin/bash
+# Copyright 2018 Quobyte Inc.
+# Installation script for Quobyte software.
+
+SLE_NAME='SLE'
+CENTOS_NAME='CentOS'
+FEDORA_NAME='Fedora'
+REDHAT_NAME='RHEL'
+OPENSUSE_NAME='openSUSE'
+UBUNTU_NAME='xUbuntu' # xUbuntu as Quobyte software download URL has xUbuntu in URL.
+DEBIAN_NAME='Debian'
+REPO_ID=''
+AUTO_CONFIRM='yes' # Default auto confirm is yes. i.e; Agree to all the installation prompts.
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+NC='\033[0m'
+COMMAND=''
+# Default non-verbose mode, if -v given, show all the command output.
+# With --interactive, sets it to yes and -v doesn't sever any purpose in this case.
+EXTRA_VERBOSE='no'
+POST_INSTALL_MSG='yes'
+NTP_PACKAGE_NAME=''
+FORCE_UNINSTALL='no'
+CLIENT_MOUNT_POINT='/quobyte' # default /quobyte
+SERVICES='/registry/metadata/data/webconsole/api/s3/nfs/' # Supported services.
+SUPPORTED_OS='/CentOS_6/CentOS_7/Debian_8/Debian_9/SLE_11_SP3/RHEL_7/RHEL_6/xUbuntu_14.04/xUbuntu_16.04/xUbuntu_18.04/openSUSE_Leap_42.2/'
+QUOBYTE_INSTALL_DOC='https://support.quobyte.com/docs/9/latest/installation.html'
+DEFAULT_REGISTRY_LOCATION='/var/lib/quobyte/devices/registry-bootstrap'
+TEMP_REGISTRY_MOUNT='/mnt/quobyte-registry'
+
+########################################################################################
+# ATTENTION:                                                                           #
+# Any new optoion/command should be added to below variables,                          #
+# otherwise script may reads missing options/values as remote host                     #
+########################################################################################
+SUPPORTED_COMMANDS='/uninstall/bootstrap/configure/add/add-client/'
+NO_VAL_OPTIONS='/-f/-v/--no-create-registry-device/--interactive/' # options that don't need any value.
+VAL_OPTIONS='/--repo-id/--qns-id/--registry-endpoints/--services/--user/--password/--licensekey/--email/--script-host-path/--currenthost/-i/--mount-point/--registry-device' # options that need a value.
+create_emtpy_registry='yes'
+
+if [ ! "$BASH_VERSION" ] ; then
+    echo 'Script requires to be executed with bash.'
+    echo "Please run the script with /bin/bash $0"
+    echo " or as a binary (requires executable permissions)"
+    echo
+    exit 1
+fi
+
+confirmation() {
+    while [ 1 ]
+    do
+      echo -n $1
+      read -n 1 RESPONSE
+      echo
+      case "$RESPONSE" in
+        "") yesno=$2; return;;
+        y|Y|"" ) yesno=1; return;;
+        n|N ) yesno=0; return;;
+        * ) echo; echo "'$RESPONSE' is not a valid response.";;
+      esac
+    done
+ }
+
+########################################################################################
+# Interactive installer, executed when no command is given                             #
+# The frunction is executed in a subshell to keep the variable and functions local     #
+########################################################################################
+interactive_install() (
+  QBREPO="https://packages.quobyte.com/repo/3/"
+  FILECHECK="/rpm/CentOS_7/quobyte.repo"
+  STEPS=6
+  CLEOL=$'\x1B[K'
+  RED=$'\x1B[91m'
+  YELLOW=$'\x1B[93m'
+  WARNING=$'\x1B[103m\x1B[30mWARNING:\x1B[27m\x1B[0m'
+  GREEN=$'\x1B[32m'
+  RESETALL=$'\x1B[0m'
+
+  MINRAM=16
+  MINCORES=8
+
+  header() {
+    echo -e '\x1Bc'
+    echo -e "\x1B[97m\x1B[44m Quobyte Installer - $1 ${CLEOL}"
+    echo -e "\x1B[0m"
+    echo
+  }
+
+  input_hosts() {
+    hosts=""
+    confirmation "Do you have a file with $1 FQDNs or IPs (one machine per line)? [y/N]" 0
+    if [ $yesno = 1 ]
+    then
+      while [ 1 ]
+      do
+        read -e -p "Please enter the file name (including full path) here: " hostfile
+        echo
+        if [ ! -f $hostfile ]; then
+          echo
+          echo "${RED}File $hostfile does not exist or cannot be read.${RESETALL}"
+          continue
+        fi
+        while read -r line || [[ -n "$line" ]]; do
+          # Skip comment lines in host file
+          case "$line" in \#*) continue ;; esac
+          hosts=$hosts" "$line
+        done < $hostfile
+        break
+      done
+    else
+      while [ 1 ]
+      do
+        read -e -p "FQDN or Machine IP address, or press <enter> to finish: " host
+        if [ "$host" == "" ]
+        then
+          break;
+        fi
+        host=$(echo ${host} | tr -d '[:space:]')
+        hosts=$hosts" "$host
+      done
+    fi
+  }
+
+  verify_hosts() {
+    errors=0
+    hosts=$1
+    for server in ${hosts[@]}
+    do
+      echo -n "Machine: $server..."
+      SSHOUT="$($sshcmd -tt $server "sudo true && free --si -g | awk  '/Mem:/{printf \"%s \",\$2}' && nproc --all")"
+      if [ $? != 0 ]
+      then
+        echo -e "${RED}FAILED!"
+        echo -e "Could not connect or execute sudo on machine $server: $SSHOUT${RESETALL}"
+        errors=1
+      elif [ "$2" != "" ]
+      then
+        elements=($(echo $SSHOUT | tr -d "\r"))
+        result=""
+        if ! [[ ${elements[0]} =~ ^[0-9]+$ ]]
+        then
+          result+="${WARNING} Could not parse amount of RAM from $server '${elements[0]}'\n"
+        else
+          if [ ${elements[0]} -lt ${MINRAM} ]
+          then
+            result+="${WARNING} $server has only ${elements[0]} GB RAM, which is less than the recommended ${MINRAM}GB.\n"
+          fi
+        fi
+
+        if ! [[ ${elements[1]} =~ ^[0-9]+$ ]]
+        then
+          result+="${WARNING} Could not parse number of cores from $server '${elements[1]}'\n"
+        else
+          if [ ${elements[1]} -lt ${MINCORES} ]
+          then
+            result+="${WARNING} $server has only ${elements[1]} cores, which is less than the recommended minimum of ${MINCORES} cores.\n"
+          fi
+        fi
+        if [ "$result" == "" ]
+        then
+          result="${GREEN}OK${RESETALL}"
+        fi
+        echo -e -n $result
+      else
+        echo -e "${GREEN}OK${RESETALL}"
+      fi
+
+    done
+  }
+
+  if [[ ! "$OSTYPE" == "linux-gnu" ]]
+  then
+    echo "This script works only with Linux at this time."
+    exit 1
+  fi
+
+  trap 'reset; exit' SIGINT
+  header "Welcome"
+  echo "Welcome to the interactive Quobyte installation."
+  echo " "
+  echo "This installer can be used to install Quobyte software on local or"
+  echo "remote machines. For convenience, we recommend that you use pre-shared"
+  echo "SSH keys for password-less login to the remote machines. Otherwise"
+  echo "you will have to enter your password multiple times for each machine."
+  echo ""
+  echo "The installer will setup your installation to use QNS,"
+  echo "the Quobyte Naming Service. This service is provided by Quobyte"
+  echo "and requires internet connectivity from all participating machines."
+  echo "QNS is provided free of charge on a best-effort basis."
+  echo ""
+  confirmation "Would you like to continue with the installation? [Y/n] " 1
+  if [ $yesno = 0 ]
+  then
+    echo
+    exit 1
+  fi
+
+  header "Step 1 of $STEPS: Configure Quobyte Repo-ID"
+  echo "To begin you need a Quobyte Repo-ID. Please login to your Quobyte account at "
+  echo "https://support.quobyte.com and copy the Repo-ID."
+  echo
+  echo "If you don't have a Quobyte account yet, please contact sales@quobyte.com or "
+  echo "call us at (650) 564-3114 or +49-30-814 591 801 (EMEA)"
+  echo
+  repo_id=""
+  while [ "${repo_id}" == "" ]
+  do
+    read -e -p "Please enter your Quobyte Repo-ID: " repo_id
+    repo_id=$(echo ${repo_id} | tr -d '[:space:]')
+    echo
+    echo "Please wait while we check your Repo-ID..."
+    if [[ ${repo_id} != http*://* ]]; then
+      checkUrl=${QBREPO}${repo_id}
+    else
+      checkUrl=${repo_id}
+    fi
+    wget -q --spider ${checkUrl}${FILECHECK}
+    if [ $? != 0 ]
+    then
+      echo "${RED}Cannot retrieve repository data."
+      echo "Please make sure you are connected to the internet and check your Repo-ID.${RESETALL}"
+      echo
+      repo_id=""
+    fi
+  done
+
+  header "Step 2 of $STEPS: Configure SSH settings"
+  echo "Please enter the username to use for the SSH connection to the target machines."
+  read -e -i $USER -p "Username: " installusr
+  echo
+  echo  "If you want to use another private key please specify the file name"
+  echo  "here or leave empty for SSH defaults."
+
+  while [ 1 ]
+  do
+    read -e -p "Path to keyfile, or empty: " keyfile
+    echo
+    sshcmd="ssh -n -l $installusr -o ConnectTimeout=4"
+    ssh_id="$installusr@"
+    if [ "$keyfile" != "" ]
+    then
+      if [ ! -f $keyfile ]
+      then
+        echo "${RED}Keyfile $keyfile does not exist or cannot be read.${RESETALL}"
+        continue
+      fi
+      sshcmd+=" -i $keyfile "
+      ssh_id=" -i ${keyfile} ${ssh_id}"
+      break
+    else
+      break
+    fi
+  done
+
+  while [ 1 ]
+  do
+    header "Step 3 of $STEPS: Add Servers"
+    echo "Now you need to designate the servers on which to install the Quobyte services."
+    echo "These servers will provide the storage for your Quobyte installation. "
+    echo " "
+    echo "Each server needs at least:"
+    echo "* Two or more unformatted storage devices (NVMe, SSD or HDD)"
+    echo "* ${MINRAM}GB of RAM or more"
+    echo "* ${MINCORES} CPU cores or more"
+    echo " "
+    echo "IMPORTANT: If the devices have been used before, please make sure to clean them"
+    echo "properly, otherwise the Quobyte device manager will not detect them. "
+    echo "See https://support.quobyte.com/docs/9/latest/ for details."
+    input_hosts "server"
+    servers=$hosts
+    if [ "$hosts" == "" ]
+    then
+      echo "${RED}You did not specify any servers to install Quobyte on."
+      echo -e "Press <enter> to repeat this step."
+      read -n 1
+      continue
+    fi
+
+    hostsArray=( $hosts )
+    if (( ${#hostsArray[@]} < 4 ))
+    then
+      echo
+      echo "${WARNING} The minimum recommended Quobyte cluster size is four!"
+      echo "You won't be able to use all Quobyte functionality."
+      echo
+      echo "Press any key to continue..."
+      read -n 1
+    fi
+    header "Step 4 of $STEPS: Verifying SSH connectivity to server machines"
+    verify_hosts "$servers" "validate"
+    if [ $errors -ne 0 ]
+    then
+      confirmation "At least one server had errors. Would you like to retry? [Y/n]" 0
+      if [ $yesno -eq 0 ]
+      then
+        exit 1
+      fi
+    else
+      echo
+      echo -e "All server machines verified successfully. Press any key to continue..."
+      read -n 1
+      break;
+    fi
+  done
+
+  while [ 1 ]
+  do
+    header "Step 5 of $STEPS: Add Clients"
+    echo "Please add all of the machines that should run a Quobyte client,"
+    echo "i.e. be able to access the files on the Quobyte cluster."
+    echo " "
+    echo "NOTE: This installer only works for Linux clients. Please refer to the Quobyte"
+    echo "manual for Windows and macOS installation steps:"
+    echo "https://support.quobyte.com/docs/9/latest/user_tools.html"
+    echo " "
+    echo "Please add the FQDN or IP address for each machine:"
+    echo
+    input_hosts "client"
+    clients=$hosts
+
+    if [ "$hosts" == "" ]
+    then
+      echo
+      echo "${RED}You did not specify any clients to install Quobyte on.${RESETALL}"
+      confirmation "Press N to install without clients or Y to add clients? [y/N]" 0
+      if [ $yesno -eq 1 ]
+      then
+        continue
+      fi
+    fi
+
+    header "Step 6 of $STEPS: Verifying SSH connectivity to client machines"
+    verify_hosts "$clients"
+    if [ $errors -ne 0 ]
+    then
+      confirmation "At least one client had errors. Would you like to retry? [Y/n]" 0
+      if [ $yesno -eq 0 ]
+      then
+        exit 1
+      fi
+    else
+      echo
+      break;
+    fi
+  done
+
+  echo
+  echo "You've answered all of the necessary questions and everything has"
+  echo -n "been configured. "
+  confirmation "Do you want to start the installation? [Y/n]" 1
+  if [ $yesno -eq 0 ]
+  then
+    echo
+    echo "Aborting Quobyte installation. Goodbye."
+    exit 1
+  fi
+  echo
+
+  header "Step 6 of $STEPS: Installing Quobyte..."
+  generated_qns_id="$(head -c 8 /dev/urandom | base64 | tr -d '/+=' | tr '[:upper:]' '[:lower:]')"
+
+  instlog=$(mktemp /tmp/quobyte-install-log.XXXXXX)
+  counter=0
+  bootstrap_node=""
+  set -o pipefail
+  for server in ${servers[@]}
+  do
+    echo "Starting install on server ${server}..." >> ${instlog}
+    if [ $counter -eq 0 ]
+    then
+      # bootstrap
+      bootstrap_node=$server
+      /bin/bash $0 bootstrap --no-post-msg --repo-id ${repo_id} --qns-id ${generated_qns_id} --services registry,data,metadata,webconsole,api,s3 ${ssh_id}${server} | tee -a ${instlog}
+    elif [ $counter -le 4 ]
+    then
+       /bin/bash $0 add --repo-id ${repo_id} --qns-id ${generated_qns_id} --services registry,data,metadata,s3 ${ssh_id}${server} | tee -a ${instlog}
+    else
+     /bin/bash $0 add --repo-id ${repo_id} --qns-id ${generated_qns_id} --services data,metadata,s3 ${ssh_id}${server} | tee -a ${instlog}
+    fi
+    if [ ! $? -eq 0 ]
+    then
+      echo "${RED}Installation of software on ${server} failed. Aborting Quobyte installation.${RESETALL}"
+      exit 1
+    fi
+    echo "---" >> ${instlog}
+    ((counter += 1))
+  done
+
+  errors=0
+  for client in ${clients[@]}
+  do
+    echo "Starting install on client ${client}..." >> ${instlog}
+    /bin/bash $0 add-client --repo-id ${repo_id} --qns-id ${generated_qns_id} ${ssh_id}${client} | tee -a ${instlog}
+    if [ ! $? -eq 0 ]
+    then
+      echo "${WARNING}Installation of client on ${server} failed."
+      echo "${WARNING}Installation of client on ${server} failed." >> ${instlog}
+      errors=1
+    fi
+  done
+
+  tmpfile=$(mktemp /tmp/quobyte-install-results.XXXXXX)
+  echo
+  cat > $tmpfile <<EOL
+* Installation successful *
+
+The system is starting and the Quobyte web console should be up
+within 60 seconds. Please point your web browser to
+http://console.${generated_qns_id}.myquobyte.net:8080 to complete the setup.
+If your servers are not accessible from the outside via their primary ip use
+http://${bootstrap_node}:8080
+
+Your Quobyte API service is available as api.${generated_qns_id}.myquobyte.net
+Use the following command to show the list of devices from the command line:
+qmgmt -u http://api.${generated_qns_id}.myquobyte.net device list
+
+The S3 proxies are reachable via s3.${generated_qns_id}. Once you create buckets you
+can access them via <bucket-name>.s3.${generated_qns_id}.myquobyte.net
+
+You can install additional Quobyte server machines with the following command:
+$0 add --repo-id ${repo_id} --services registry,data,metadata --qns-id ${generated_qns_id} ${ssh_id}remote-host
+
+and additional client machines with:
+$0 add-client --repo-id ${repo_id} --qns-id ${generated_qns_id} ${ssh_id}remote-host
+
+This information has been written to $tmpfile for future reference.
+EOL
+
+  if [ ! $errors -eq 0 ]
+  then
+    echo -e "\nThe installation failed on at least one client. Please check $instlog for details." >> $tmpfile
+  else
+    echo -e "\nYou can find the complete install log in $instlog." >> $tmpfile
+  fi
+
+  header "Quobyte installation finished"
+  more $tmpfile
+)
+
+########################################################################################
+# Set QUOBYTE_INSTALL_DEBUG to 1 to print debug messages                               #
+########################################################################################
+debug_message(){
+  if [[ "${QUOBYTE_INSTALL_DEBUG}" = '1' ]] ; then
+    echo -e "${RED}DEBUG:${NC} ${1}"
+  fi
+}
+
+print_help(){
+  echo ''
+  echo 'Synopsis: This script helps to install Quobyte on a fresh server or container environment.'
+  echo "  You can use it to install Quobyte on your local machine by omitting 'remote-host (see Usage) or"
+  echo "    on remote host 'remote-host' (script uses SSH to execute on remote host)."
+  echo '  Script requires root privileges:'
+  echo '    -for remote host installation, given user must have sudo capabilities or root user on remote host'
+  echo '    -for local installation, script must be run with sudo or as root user'
+  echo ''
+  echo 'Usage: install_quobyte.sh Command [Options] [[user@]remote-host]'
+  echo ''
+  echo 'General Options'
+  echo '  --interactive   runs script in interactive mode'
+  echo "      default is non-interactive mode, i.e, assumes 'yes' for all the 'yes or no' prompts"
+  echo '  -v              verbose mode, outputs command execution messages'
+  echo '      default is non-verbose mode. You can use it to see command execution messages in non-interactive mode.'
+  echo '      --interactive always runs in verbose mode, -v does not serve any purpose with --interactive.'
+  echo '  -i  <key-file>  host authentication key'
+  echo ''
+  echo 'Commands:'
+  echo '  bootstrap       installs first node'
+  echo '    options:'
+  echo '      --repo-id              <repository-id>       repo-id from https://support.quobyte.com'
+  echo '      --registry-device      <device>              unformatted device for bootstrap registry'
+  echo '      --registry-endpoints   <records>             srv record or comma separated list without spaces, disables QNS options'
+  echo '      --services             <service-list>        comma separated list without spaces'
+  echo "                                                     On 'bootstrap' node, script installs registry,webconsole,api by default."
+  echo "                                                     Additional services can be installed with --services <service-list>"
+  echo "                                                     See 'Services option notes' at the bottom"
+  echo "    NOTE: With bootstrap, If --registry-endpoints not given, script generates qns-id."
+  echo "          Generated 'qns-id' should be used with 'add' while adding additional nodes."
+  echo ''
+  echo '  add             adds additional node'
+  echo '    options:'
+  echo '      --repo-id              <repository-id>       repo-id from https://support.quobyte.com'
+  echo '      --registry-device      <device>              unformatted device for registry'
+  echo '      --services             <service-list>        comma separated list without spaces.'
+  echo "                                                     On 'add' node, script does not install any service."
+  echo "                                                     All required services can be installed with --services <service-list>"
+  echo "                                                     See 'Services option notes' at the bottom"
+  echo '      --no-create-registry-device                  does not create registry device'
+  echo '      --qns-id               <qns-id>              can be found in /etc/quobyte/registry.cfg on Quobyte bootstrap node'
+  echo '         or'
+  echo '      --registry-endpoints   <records>             srv record or comma separated list without spaces'
+  echo '    NOTE: With add, one of --qns-id or --registry-endpoints must be given but not both.'
+  echo "          Use the same method(QNS/registry-endpoints) for 'add', that is used with 'bootstrap'."
+  echo ''
+  echo '  configure       configures basic setup'
+  echo '    options:'
+  echo '      --user                 <user>'
+  echo '      --password             <password>'
+  echo '      --email                <email>'
+  echo '    NOTE: With configure, user,password and email are required'
+  echo ''
+  echo '  add-client      adds Quobyte client'
+  echo '    options:'
+  echo '      --repo-id              <repository-id>       repo-id from https://support.quobyte.com'
+  echo '      --mount-point          <mount-point>         mount point (should not have spaces). Multiple mount points are not supported'
+  echo '      --qns-id               <qns-id>              can be found in /etc/quobyte/registry.cfg on Quobyte bootstrap node'
+  echo '         or'
+  echo '      --registry-endpoints   <records>             srv record or comma separated list without spaces'
+  echo ''
+  echo '  uninstall       uninstalls Quobyte'
+  echo '    options:'
+  echo '      -f                                          deletes /var/lib/quobyte and /etc/quobyte'
+  echo ''
+  echo 'Services option notes:'
+  echo '  Supported services: registry,data,metadata,api,s3,webconsole,nfs'
+  echo ''
+  echo '  Some services are only supported on particular OS distributions.'
+  echo "  See ${QUOBYTE_INSTALL_DOC} for details."
+  echo ''
+}
+
+if [[ ${1} = '' ]]; then
+  interactive_install
+  exit 0
+fi
+
+if [[ ${1} = '-h' || ${1} = '--help' || ${1} = '' ]]; then
+  print_help
+  exit 0
+fi
+
+create_new_log(){
+  INSTALLATION_LOG="/tmp/quobyte_installation_$USER.log"
+  echo "Log file created by install_quobyte.sh on $(date) by $USER"> ${INSTALLATION_LOG}
+}
+
+# @Execute
+create_new_log
+
+########################################################################################
+# Verbose mode for script execution                                                    #
+#   If -v supplied, write echo messages to to STDOUT else to log file                  #
+# Usage: script_verbose_message 'message' ['info'/'notify']                         #
+#  default- white colored output                                                       #
+#           'info' - green colored output on verbose mode (-v)                         #
+#           'notify'- red colored and displayed always irrespective of -v              #
+#           'user_action'- message for user prompts( ex: overriding files etc )        #
+########################################################################################
+script_verbose_message(){
+  if [[ "${2}" = 'notify' ]]; then
+    echo ${1} >> ${INSTALLATION_LOG}
+    echo -e ${RED}${1}${NC}
+  elif [[ "${2}" = 'user_action' ]]; then
+    echo "${1}"
+  else
+     echo ${1} >> ${INSTALLATION_LOG}
+    if [[ "${2}" = 'info' ]]; then
+      echo -e ${GREEN}${1}${NC}
+    else
+      echo ${1}
+    fi
+  fi
+}
+
+########################################################################################
+# Usage: is_supported_option 'option' 'command'                                        #
+#   echos "supported" if operation is supported by given command else nothing         #
+########################################################################################
+is_supported_option(){
+  case $1 in
+    --interactive | -v | -i | --no-post-msg ) echo "supported" ; return;;
+  esac
+  if [[ ! -z "$2" ]]; then
+    case "$2" in
+      bootstrap )
+        case "$1" in
+          --repo-id | --registry-endpoints | --services | --qns-id | --registry-device) echo "supported" ; return ;;
+          * ) return ;;
+        esac
+      ;;
+      add )
+        case "$1" in
+          --repo-id | --registry-endpoints | --qns-id | --services | --registry-device ) echo "supported" ; return ;;
+          * ) return ;;
+        esac
+      ;;
+      uninstall )
+        case "$1" in
+          -f ) echo "supported" ; return ;;
+          * ) return ;;
+        esac
+      ;;
+      configure)
+        case "$1" in
+          --user | --password | --licensekey| --email) echo "supported" ; return ;;
+          * ) return ;;
+        esac
+      ;;
+      add-client )
+       case "$1" in
+          --repo-id | --mount-point | --registry-endpoints | --qns-id ) echo "supported" ; return ;;
+          * ) return ;;
+        esac
+      ;;
+    esac
+  fi
+}
+
+########################################################################################
+# This validation ensures services are given without mistakes, as script currently     #
+# doesn't support adding additional service after installation, it would be better to  #
+# validate and stop on erred service names.                                            #
+########################################################################################
+validate_opt_services(){
+  IFS=',' read -r -a services <<< "${services_string}"
+  for service in "${services[@]}"
+  do
+    if [[ -z "$(echo "${SERVICES}" | grep  "/$service/")" ]]; then
+      script_verbose_message "Invalid service ${service}." 'notify'
+      exit 1
+    fi
+  done
+}
+
+########################################################################################
+# This validation ensures 'add' given with required registry value                       #
+#      --qns-id or --registry-endpoints                                                #
+########################################################################################
+validate_registry_opts(){
+   if [[ (${COMMAND} = 'add' || ${COMMAND} = 'add-client' ) && ( -z  "${registry_endpoints}") && ( -z "${qns_id}" ) ]]; then
+      script_verbose_message "Required --qns-id or --registry-endpoints for ${COMMAND}." 'notify'
+       exit 1
+   fi
+
+   if [[ ( ! -z  "${registry_endpoints}") && ( ! -z "${qns_id}" ) ]]; then
+     script_verbose_message "Only one of --qns-id or --registry-endpoints for ${COMMAND} but not both." 'notify'
+     exit 1
+   fi
+ }
+
+validate_configure_opts(){
+  if [[ (${COMMAND} = 'configure') &&  ( -z "${config_user}" || -z "${config_passwd}" || -z "${email}" ) ]]; then
+    script_verbose_message "Given empty value for --user/--password/--email. All these are required for 'configure'." 'notify'
+    exit 1
+  fi
+}
+
+########################################################################################
+# All required option validations should be validated before intiating command         #
+########################################################################################
+validate_opt_values(){
+  validate_opt_services
+  validate_registry_opts
+  validate_configure_opts
+}
+
+parse_opts(){
+    eval set -- "${valid_opts}"
+    while true; do
+      case "$1" in
+        --no-post-msg ) POST_INSTALL_MSG='no'; shift ;;
+        -v ) EXTRA_VERBOSE='yes'   ; shift ;;
+        -i ) shift ; REMOTE_HOST_KEY="${1}" ; shift ;;
+        --registry-device ) shift; REGISTRY_DEV="${1}";shift;;
+        --interactive ) AUTO_CONFIRM='no' ; shift ;;
+        --repo-id ) shift; REPO_ID="${1}" ; shift ;;
+        --registry-endpoints ) shift; registry_endpoints="${1}" ; shift ;;
+        --qns-id ) shift ; qns_id="${1}" ; shift ;;
+        --no-create-registry-device )  create_emtpy_registry='no'; shift ;;
+        --services ) shift ; services_string="$1" ; shift ;;
+        -f ) FORCE_UNINSTALL='yes' ; shift ;;
+        --user ) shift ; config_user="$1" ; shift ;;
+        --password ) shift ; config_passwd="$1" ; shift ;;
+        --email ) shift ; email="$1" ; shift ;;
+        --license) shift ; licensekey="$1" ; shift ;;  # TODO: add licensekey functionality.
+        --mount-point) shift; CLIENT_MOUNT_POINT="${1}" ; shift ;;
+        -- ) shift ; break ;;
+        * ) shift ; break ;;
+      esac
+    done
+}
+
+#########################################################################################################
+# GNU getopt doesn't enforce missing values with options and doesn't stop execution on invalid options  #
+#   validate_opts                                                                                       #
+#      1) enforces the missing values, if the supported option is given for command                     #
+#      2) makes sure unsupported options are not given                                                  #
+#########################################################################################################
+validate_opts(){
+  local opt_end_index=$(echo "${valid_opts}" | grep -b -o -- "-- '"$COMMAND"'" | cut -d: -f1)
+  local valid_opts_parsed="${valid_opts:0:$opt_end_index}" # cannonicalized options from getopt, by removing options that did not have -/--
+  local opts=($@) # actual options given to script
+  for opt in "${opts[@]}"
+  do
+    if [[ ! -z $(echo "$opt" | grep -- "^-") ]]; then
+      if [[ -z $(echo $valid_opts_parsed | grep -w -- "$opt") ]]; then # Given option with command not cannonicalized by getopt
+        if [[ ! -z $(is_supported_option "$opt" "$COMMAND") ]]; then # If it is supported by command, that mean value not given for the option.
+          script_verbose_message "Value required for '$opt' with '$COMMAND'" 'notify'
+          exit 1
+        else
+          script_verbose_message "'$opt' is not supported by '$COMMAND'" 'notify'
+          exit 1
+        fi
+      fi
+    fi
+  done
+}
+
+######################################################################################################
+# Check for remote options                                                                           #
+#    Checks last three arguments and determines whether script execution is on remote/local machine  #
+######################################################################################################
+read_remote_options(){
+  local skipNextVale='n'
+  if [[ $# -gt 3 ]]; then
+    last_3_options=(${@: -3})
+  else
+    last_3_options=(${@})
+  fi
+  for option in "${last_3_options[@]}"
+  do
+    if [[ ${skipNextVale} != 'n' ]]; then
+      skipNextVale='n'
+      continue
+    fi
+      if [[ ! -z "$(echo "${SUPPORTED_COMMANDS}" | grep  "/${option}/")" ]]; then # Command, so skip it
+        REMOTE_HOST=''
+        continue
+      elif [[ ! -z "$(echo "${VAL_OPTIONS}" | grep  "/${option}/")" ]]; then # Value option, so skip value that is in next position
+        REMOTE_HOST=''
+        skipNextVale='y'
+        continue
+      elif [[ ! -z "$(echo "${NO_VAL_OPTIONS}" | grep  "/${option}/")" ]];then # Flag like -v that doesn't take any value.
+        REMOTE_HOST=''
+        continue
+      else
+        REMOTE_HOST=${option}
+      fi
+  done
+  if [[ ! -z "$(echo "${SUPPORTED_COMMANDS}${VAL_OPTIONS}${NO_VAL_OPTIONS}" | grep  "/${REMOTE_HOST}/")" || ( ! -z $(echo $REMOTE_HOST | grep -- "^-") ) ]]; then
+    REMOTE_HOST=''
+  fi
+  debug_message "Identified Host:${REMOTE_HOST}. If host is empty, that means script is executing on local machine."
+}
+
+process_command_options(){
+  if [[ ! -z $(getopt &> /dev/null | grep 'command not found' ) ]] ; then
+    script_verbose_message 'Quobyte installer requires GNU getopt utility.' 'notify'
+    exit 1
+  fi
+  if [[ "${1}" = '--currenthost' ]]; then
+    shift ; HOST_NAME="${1}" ; shift; # Internal, used to identity installer path on host for print_post_bootstrap_instructions.
+  fi
+  if [[ "${1}" = '--script-host-path' ]];then
+    shift ; SCRIPT_HOST_PATH="${1}" ; shift; # Internal, used to identity user supplied host name for remote execution.
+  fi
+  COMMAND="${1}" ; # shift ;
+  if [[ "${COMMAND}" = 'bootstrap' ]]; then
+    valid_opts=`getopt -q -o vi: --longoptions interactive,no-post-msg,registry-endpoints:,repo-id:,qns-id:,services:,registry-device: -n 'install_quobyte' -- "$@"`
+  elif [[ "${COMMAND}" = 'add' ]]; then
+    valid_opts=`getopt -q -o vi: --longoptions interactive,no-create-registry-device,registry-device:,registry-endpoints:,repo-id:,qns-id:,services: -n 'install_quobyte' -- "$@"`
+  elif [[ "${COMMAND}" = 'uninstall' ]]; then
+    valid_opts=`getopt -q -o vfi: --long interactive -n 'install_quobyte' -- "$@"`
+  elif [[ "${COMMAND}" = 'configure' ]]; then
+    valid_opts=`getopt -q -o vi: --long interactive,user:,password:,email:,license: -n 'install_quobyte' -- "$@"`
+  elif [[ "${COMMAND}" = 'add-client' ]]; then
+    valid_opts=`getopt -q -o vi: --long interactive,registry-endpoints:,repo-id:,qns-id:,mount-point: -n 'install_quobyte' -- "$@"`
+  else
+    script_verbose_message "${1} is not a valid Quobyte installer command" 'notify'
+    exit 1
+  fi
+  shift; # It must be exactly after command identification and before command validating options.
+  if [[  -z "$SCRIPT_HOST_PATH" ]] ;then # options are already validate on local machine before intiating execution on remote, so can be skipped.
+    read_remote_options "$@"
+    validate_opts "$@"
+  fi
+
+  parse_opts $@
+  validate_opt_values
+}
+
+
+########################################################################################
+# @Execute Read options specified                                                      #
+#  Having it here makes script bit faster and exits early if invalid option is given   #
+########################################################################################
+options=($@)
+process_command_options "$@"
+
+########################################################################################
+# @Execute Quobyte Command execution starts from here                                  #
+#   If REMOTE_HOST identified during execution, script copies itself                   #
+#     and starts exectuion on remote machine.                                          #
+########################################################################################
+
+if [[ ! -z ${REMOTE_HOST} ]]; then
+  # Strip remote options and then execute same command on remote machine.
+  if [[ ! -z "$( echo ${REMOTE_HOST} | grep '@')" ]]; then
+     host="$( echo ${REMOTE_HOST} | cut -d@ -f2)"
+  else
+     host=${REMOTE_HOST}
+  fi
+  len=${#options[@]}
+  options=${options[@]:0:$len-1}
+  script_verbose_message "Executing Quobyte installer command on ${host}" 'info'
+  if [[ ! -z ${REMOTE_HOST_KEY} ]]; then
+    debug_message "Installation started on ${REMOTE_HOST} with keyfile ${REMOTE_HOST_KEY}"
+    cat $(dirname $0)/$(basename $0) | ssh -i ${REMOTE_HOST_KEY} ${REMOTE_HOST} "cat > /tmp/install_quobyte" && ssh -tt -i ${REMOTE_HOST_KEY} ${REMOTE_HOST} "sudo chmod +x /tmp/install_quobyte &&
+      sudo /tmp/install_quobyte --currenthost ${host} --script-host-path ${0} ${options} "
+    if [ ! $? -eq 0 ]
+    then
+      echo -e "${RED}Please resolve reported issues and re-run the command.${NC}"
+      exit 1
+    fi
+  else
+    debug_message "Installation started on ${REMOTE_HOST} without keyfile"
+    cat $(dirname $0)/$(basename $0) | ssh ${REMOTE_HOST} "cat > /tmp/install_quobyte" && ssh -tt ${REMOTE_HOST} "sudo chmod +x /tmp/install_quobyte &&
+    sudo /tmp/install_quobyte --currenthost ${host}  --script-host-path ${0} ${options} "
+    if [ ! $? -eq 0 ]
+    then
+      echo -e "${RED}Please resolve reported issues and re-run the command.${NC}"
+      exit 1
+    fi
+  fi
+  debug_message "Script excuted on ${host} with options : ${options}"
+else
+  if [[ -z "$SCRIPT_HOST_PATH" ]]; then
+    script_verbose_message 'Executing Quobyte installer command on localhost' 'info'
+  fi
+  if [[ $EUID > 0 ]]; then
+    if [[ ! -z "$SCRIPT_HOST_PATH" ]]; then # If SCRIPT_HOST_PATH is empty, that says script is running on local machine.
+       echo -e "${RED}The user executing this script must be able to sudo or root user${NC}"
+    else
+       echo -e "${RED}install_quobyte.sh must be run with sudo or as root user${NC}"
+    fi
+    exit 1
+  fi
+
+  ###################################################################################
+  #  ATTENTION: everthing that needs to be executed on remote when remote given     #
+  #         should go below                                                         #
+  ###################################################################################
+
+########################################################################################
+# Prompts repository id if not supplied with script execution commmand                 #
+#   - Prompts repeatedly till some repository id entered                               #
+########################################################################################
+check_repoID(){
+  if [[ -z ${REPO_ID} ]]; then
+    script_verbose_message "Please enter your repo-id from https://support.quobyte.com" 'notify'
+    read REPO_ID
+  fi
+  echo ${REPO_ID} | grep -q -v [0-9a-f]
+  local REPO_ID_VALID=$?
+  while [[ "${REPO_ID_VALID}" -eq 0 ]]; do
+    script_verbose_message 'Entered Quobyte repo-id is not valid' 'notify'
+    script_verbose_message 'Please enter valid Quobyte repo-id' 'notify'
+    read REPO_ID
+    echo ${REPO_ID} | grep -q -v [0-9a-f]
+    if [[ $? -eq 0  &&  -n "${REPO_ID}" ]]; then
+      REPO_ID_VALID=1
+    fi
+  done
+}
+
+########################################################################################
+#  ATTENTION:  CARE sending passwords as plain text                                    #
+#   logs commands to /tmp/quobyte_installation.log for non-interactive mode            #
+#   (execution without --interactive),                                                 #
+#  Handle auto-confirm and --vv options  before executing command                      #
+#  If -y NOT supplied, commands are modified to run in interactive mode                #
+#  If -vv supplied, output command execution messages                                  #
+########################################################################################
+adjust_command_to_user_options(){
+   if [[ "${AUTO_CONFIRM}" = 'yes' ]]; then
+       echo "Command: ${1}" >>  ${INSTALLATION_LOG}
+     if [[ "${EXTRA_VERBOSE}" = 'yes' ]]; then
+       sh -c "${1}"  | tee -a ${INSTALLATION_LOG}
+     else
+       sh -c "${1}" 2>&1 >> ${INSTALLATION_LOG}
+    fi
+  else # remove auto yes flags and then run commands in interactive mode
+    main_string="${1}"
+    interactive_command=${main_string/-y/ }
+    interactive_command=${interactive_command/--non-interactive/ }
+    interactive_command=${interactive_command/--force-yes/ }
+    echo "Command: ${interactive_command}" >>  ${INSTALLATION_LOG}
+    # Cannot write to log file due to tee hang on input dialog https://stackoverflow.com/questions/30687504/redirected-output-hangs-when-using-tee
+   sh -c "${interactive_command}"
+  fi
+}
+
+determine_OS_details(){
+  if [[ -f /etc/os-release ]]; then
+    OSName="$(grep ^NAME /etc/os-release | cut -d= -f2 | cut -d\" -f2)"
+    OSVersion="$(grep VERSION_ID /etc/os-release | cut -d= -f2 | cut -d\" -f2)"
+  elif [[ -f /etc/system-release-cpe ]]; then # could be centos6
+    if [[ ( ! -z "$(cat /etc/system-release-cpe | grep -i "centos")" ) && ( ! -z "$(cat /etc/system-release-cpe | grep -i ":6:")" )  ]]; then
+      OSName=${CENTOS_NAME}
+      OSVersion="6"
+    fi
+  else
+    script_verbose_message 'Could not Identity OS details.' 'notify'
+    script_verbose_message 'Make sure /etc/os-release exists on the machine.' 'notify'
+    exit 1
+  fi
+  adjust_OS_name
+  script_verbose_message "Identified OS: ${OSName}" "info"
+  script_verbose_message "Identified Version id: ${OSVersion}" "info"
+}
+
+adjust_OS_name(){
+  local original_osname=${OSName}
+  local original_os_version=${OSVersion}
+  if [[ ! -z "$(echo "${OSName}" | grep -i "centos")" ]]; then
+    OSName=${CENTOS_NAME}
+  elif [[ ! -z "$(echo "${OSName}" | grep -i "opensuse")" ]] ; then
+    OSName=${OPENSUSE_NAME}
+    if [[ "${OSVersion}" = '42.2' ]]; then
+      OSVersion='Leap_42.2'
+    fi
+  elif [[ ! -z "$(echo "${OSName}" | grep -i "fedora" )" ]] ; then
+    OSName=${FEDORA_NAME}
+  elif [[ ! -z "$(echo "${OSName}" | grep -i "ubuntu" )" ]] ; then
+    OSName=${UBUNTU_NAME}
+  elif [[ ! -z "$(echo "${OSName}" | grep -i "debian" )" ]] ; then
+    OSName=${DEBIAN_NAME}
+  elif [[ ! -z "$(echo "${OSName}" | grep -i "Red Hat Enterprise Linux Server" )" ]] ; then
+    OSName=${REDHAT_NAME}
+    if [[ ${OSVersion} = 7.* ]]; then
+      OSVersion='7';
+    elif [[  ${OSVersion} = 6.* ]]; then
+      OSVersion='6';
+    fi
+  elif [[ "${OSName}" = 'SLES' ]] ; then
+    OSName=${SLE_NAME}
+    if [[ "${OSVersion}" = '11.3' ]] ; then
+      OSVersion='11_SP3'
+    fi
+  else
+    script_verbose_message "${original_osname} is not supported. See ${QUOBYTE_INSTALL_DOC}#supported-linux-distributions" 'notify'
+    exit 1
+  fi
+  if [[  -z "$(echo "${SUPPORTED_OS}" | grep -i ${OSName}_${OSVersion})" ]]; then
+     script_verbose_message "${original_osname} version ${original_os_version} is not supported. See ${QUOBYTE_INSTALL_DOC}#supported-linux-distributions" 'notify'
+    exit 1
+  fi
+}
+
+get_time_service_status(){
+ if [[ "${DAEMON_TYPE}" = 'systemd' ]]; then
+   sh -c "(((sudo systemctl status ${1} || sudo systemctl status ${1}d ) 2>&1 )  |grep -w 'Active:' |  sed 's/.*Active: \?\([a-zA-Z0-9]* [(a-zA-Z0-9)-]*\).*/\1/' )"
+ else
+   sh -c "(sudo /etc/init.d/${1} status 2>&1)"
+ fi
+}
+
+install_time_service(){
+  local is_already_installed='no'
+  local running_package=''
+  if [[ "$(get_time_service_status 'chrony')" = 'active (running)' ]]; then
+    running_package='chrony'
+  elif [[   "$(get_time_service_status 'ntp')" = 'active (running)' ]];then
+    running_package='ntp'
+  fi
+  if [[ ! -z "${running_package}" ]]; then
+    is_already_installed='yes'
+    NTP_PACKAGE_NAME=${running_package}
+  else
+    if [[ $(is_software_installed 'chrony') -eq 1 ]]; then
+      if [[ $(is_software_installed 'ntp') -eq 1  ]]; then
+        case "${OSName}" in
+          ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME})
+            adjust_command_to_user_options 'sudo yum -y install chrony'
+          ;;
+          ${OPENSUSE_NAME})
+            adjust_command_to_user_options 'sudo zypper --non-interactive addrepo http://download.opensuse.org/repositories/home:aevseev/openSUSE_42/home:aevseev.repo'
+            adjust_command_to_user_options 'sudo zypper --non-interactive refresh'
+            adjust_command_to_user_options 'sudo zypper --non-interactive install chrony'
+          ;;
+          ${UBUNTU_NAME} | ${DEBIAN_NAME})
+            adjust_command_to_user_options 'sudo apt-get -y install chrony'
+          ;;
+        esac
+        if [[ $(is_software_installed 'chrony') -eq 1  ]]; then #if chrony not installed yet, install ntp.
+          case "${OSName}" in
+            ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME})
+              adjust_command_to_user_options 'sudo yum -y install ntp'
+            ;;
+            ${OPENSUSE_NAME} | ${SLE_NAME})
+              if [[ "${OSName}" = ${OPENSUSE_NAME} ]]; then
+                adjust_command_to_user_options 'sudo zypper --non-interactive  addrepo http://download.opensuse.org/repositories/network:time/openSUSE_Leap_42.2/network:time.repo'
+                adjust_command_to_user_options 'sudo zypper --non-interactive refresh'
+                adjust_command_to_user_options 'sudo zypper --non-interactive install ntp'
+              else
+                adjust_command_to_user_options 'sudo zypper --non-interactive install ntp'
+              fi
+            ;;
+            ${UBUNTU_NAME} | ${DEBIAN_NAME})
+             adjust_command_to_user_options 'sudo apt-get -y install chrony'
+            ;;
+          esac
+          NTP_PACKAGE_NAME='ntp'
+        else
+          NTP_PACKAGE_NAME='chrony'
+        fi
+    else
+      is_already_installed='yes'
+      NTP_PACKAGE_NAME='ntp'
+    fi
+  else
+     is_already_installed='yes'
+     NTP_PACKAGE_NAME='chrony'
+   fi
+ fi
+  if [[ ${is_already_installed} = 'yes' ]]; then
+    script_verbose_message "Found existing ${NTP_PACKAGE_NAME} package" 'info'
+  else
+    script_verbose_message "Installed ${NTP_PACKAGE_NAME}" 'info'
+  fi
+}
+
+# Installs dependencies needed by client and server.
+install_common_dependencies() {
+  case "${OSName}" in
+    ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME})
+      if [[ ${OSVersion} = '6' ]]; then
+        adjust_command_to_user_options 'sudo rpm -i http://dl.fedoraproject.org/pub/epel/6/i386/epel-release-6-8.noarch.rpm'
+      fi
+      adjust_command_to_user_options 'sudo yum -y install wget yum-utils util-linux'
+    ;;
+    ${OPENSUSE_NAME} | ${SLE_NAME})
+      adjust_command_to_user_options 'sudo zypper --non-interactive install wget util-linux'
+      ;;
+    ${UBUNTU_NAME} | ${DEBIAN_NAME})
+      if [[ ${OSName} = ${UBUNTU_NAME} ]]; then
+        export RUNLEVEL=1
+        adjust_command_to_user_options 'sudo add-apt-repository universe'
+        adjust_command_to_user_options 'sudo apt-get -y update'
+      fi
+      adjust_command_to_user_options 'sudo apt-get -y install wget apt-transport-https uuid-runtime perl gnupg dialog debconf ssh'
+      echo 'debconf debconf/frontend select Readline' | debconf-set-selections
+      echo 'debconf debconf/priority select high' | debconf-set-selections
+      if [[ ${OSName} = ${DEBIAN_NAME}  &&   ${OSVersion} = '8' ]]; then
+        echo "deb http://http.debian.net/debian jessie-backports main" >> /etc/apt/sources.list.d/quobyte.list
+        adjust_command_to_user_options 'sudo apt-get update'
+        adjust_command_to_user_options 'sudo apt-get -y --force-yes install apt-transport-https'
+      fi
+    ;;
+  esac
+}
+
+create_python2_symlink(){
+  confirmation "Quobyte requires /usr/bin/python2 to be referenced with python2.7 interpreter. Would you like to update /usr/bin/python2? [y/N]" 0
+  if [[ $yesno = 1 ]];then
+     adjust_command_to_user_options 'sudo ln -s /usr/bin/python2.7 /usr/bin/python2'
+  fi
+}
+
+check_python_dependency(){
+  if [[ ! -f /usr/bin/python2.7 ]];then
+    script_verbose_message 'Python 2.7 installation not found in /usr/bin.' 'notify'
+    script_verbose_message ' Install python2.7 and set /usr/bin/python2 to python2.7 for qmgmt to work' 'notify'
+    return
+  fi
+  # qmgmt requires python2 with python2.7 interpreter
+  if [[ ! -f /usr/bin/python2 ]];then
+    create_python2_symlink
+  elif [[ "$(ls -l /usr/bin/python2 | grep -E "python2.7|python2.6" )" = "" ]]; then
+    script_verbose_message 'Python2.7/python2.6 must be referenced with /usr/bin/python2 to use qmgmt' 'notify'
+  fi
+}
+
+install_dependencies(){
+  install_common_dependencies
+  case "${OSName}" in
+    ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME})
+      if [[ ${OSVersion} = '6' ]]; then
+        if [[  "${OSName}" = ${CENTOS_NAME} ]]; then
+          adjust_command_to_user_options 'sudo yum -y update'
+          adjust_command_to_user_options 'sudo yum -y install python'
+        elif [[ "${OSName}" = ${REDHAT_NAME} ]]; then
+          adjust_command_to_user_options "sudo sh -c 'wget -qO- http://people.redhat.com/bkabrda/scl_python27.repo' >> /etc/yum.repos.d/scl.repo"
+          adjust_command_to_user_options 'sudo yum -y install python27'
+        fi
+      fi
+      adjust_command_to_user_options 'sudo yum -y install java-1.8.0-openjdk-headless python2'
+    ;;
+    ${OPENSUSE_NAME} | ${SLE_NAME})
+      adjust_command_to_user_options 'sudo zypper --non-interactive install java-1_8_0-openjdk-headless'
+      ;;
+    ${UBUNTU_NAME} | ${DEBIAN_NAME})
+      if [[ ${OSName} = ${DEBIAN_NAME}  &&   ${OSVersion} = '8' ]]; then
+        echo "deb http://http.debian.net/debian jessie-backports main" >> /etc/apt/sources.list.d/quobyte.list
+        adjust_command_to_user_options 'sudo apt-get update'
+        adjust_command_to_user_options 'sudo apt-get install -y -t jessie-backports openjdk-8-jdk python2.7'
+      elif [[ ${OSName} = ${UBUNTU_NAME}  &&  ${OSVersion} = '14.04'  ]]; then
+        if [[ "${AUTO_CONFIRM}" = 'yes' ]]; then
+          echo debconf shared/accepted-oracle-license-v1-1 select true |  sudo debconf-set-selections #automatically accept oracle license
+          echo debconf shared/accepted-oracle-license-v1-1 seen true |  sudo debconf-set-selections #automatically accept oracle license
+        fi
+        echo "deb http://ppa.launchpad.net/webupd8team/java/ubuntu trusty main" | tee /etc/apt/sources.list.d/webupd8team-java.list
+        echo "deb-src http://ppa.launchpad.net/webupd8team/java/ubuntu trusty main" | tee -a /etc/apt/sources.list.d/webupd8team-java.list
+        adjust_command_to_user_options 'sudo apt-key adv --keyserver keyserver.ubuntu.com --recv-keys EEA14886'
+        adjust_command_to_user_options 'sudo apt-get -y update'
+        adjust_command_to_user_options 'sudo apt-get -y install python2.7 oracle-java8-installer'
+      else
+        adjust_command_to_user_options 'sudo apt-get -y install openjdk-8-jre-headless python2.7'
+      fi
+    ;;
+  esac
+  if [[ "${OSName}" = "${UBUNTU_NAME}" || "${OSName}" = ${DEBIAN_NAME}  ]]; then
+    check_python_dependency
+  fi
+  install_time_service
+  enable_time_service
+}
+
+add_quobyte_repositories(){
+  local quobyteImageURL="https://packages.quobyte.com/repo/3/${REPO_ID}"
+  if [[ ${REPO_ID} == http*://* ]]; then
+    # User specified alternative repo URL prefix
+    script_verbose_message "Installing from alternative repository: ${REPO_ID}"
+    quobyteImageURL=${REPO_ID}
+  fi
+  case "${OSName}" in
+    ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME})
+      quobyteImageURL="${quobyteImageURL}/rpm/${OSName}_${OSVersion}/quobyte.repo"
+      adjust_command_to_user_options "sudo  yum-config-manager --add-repo ${quobyteImageURL}"
+    ;;
+    ${OPENSUSE_NAME} | ${SLE_NAME})
+      quobyteImageURL="${quobyteImageURL}/rpm/${OSName}_${OSVersion}/quobyte.repo"
+      adjust_command_to_user_options "sudo zypper --non-interactive --gpg-auto-import-keys addrepo ${quobyteImageURL}"
+      adjust_command_to_user_options 'sudo zypper --non-interactive --gpg-auto-import-keys refresh'
+    ;;
+    ${UBUNTU_NAME} | ${DEBIAN_NAME})
+      if [[ ${OSName} = ${UBUNTU_NAME} ]]; then
+        case ${OSVersion} in
+          18.04) RELEASE='bionic' ;;
+          16.04) RELEASE='xenial' ;;
+          14.04)
+              RELEASE='trusty'
+            echo "Acquire::https::packages.quobyte.com::Verify-Peer \"false\";" >> /etc/apt/apt.conf.d/80quobyte-ssl-exceptions
+            echo "Acquire::https::packages.quobyte.com::Verify-Host \"false\";" >> /etc/apt/apt.conf.d/80quobyte-ssl-exceptions
+            ;;
+        esac
+      elif [[ ${OSName} = ${DEBIAN_NAME} ]]; then
+        case ${OSVersion} in
+          8) RELEASE='jessie' ;;
+          9) RELEASE='stretch' ;;
+        esac
+      fi
+      echo "deb [arch=amd64] ${quobyteImageURL}/apt ${RELEASE} main" >>  /etc/apt/sources.list.d/quobyte.list
+      adjust_command_to_user_options "sudo wget -q ${quobyteImageURL}/apt/pubkey.gpg -O - | sudo apt-key add -"
+      adjust_command_to_user_options 'sudo apt-get update'
+    ;;
+  esac
+ }
+
+########################################################################################
+# Installs quobyte-server and quobyte-client by default                                #
+#  Optional argument: service names separated by comma (ex: nfs,openstack-juno)        #
+#       - if optional argument given installs additional services                      #
+########################################################################################
+install_quobyte_software(){
+  local install_packages=''
+  if [[ ! -z "${1}" ]]; then
+    local input_string="${1}"
+    local additional_packages="quobyte-${input_string/,/ quobyte-}"
+    install_packages="${install_packages} ${additional_packages}"
+  fi
+  case "${OSName}" in
+    ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME})
+      adjust_command_to_user_options "sudo yum -y install ${install_packages}"
+    ;;
+    ${OPENSUSE_NAME} | ${SLE_NAME})
+      adjust_command_to_user_options "sudo zypper --non-interactive install ${install_packages}"
+    ;;
+    ${UBUNTU_NAME} | ${DEBIAN_NAME})
+      adjust_command_to_user_options "sudo apt-get -y install ${install_packages}"
+    ;;
+  esac
+}
+
+enable_time_service(){
+  if [[ "${DAEMON_TYPE}" = 'systemd' ]]; then
+    if [[ "${NTP_PACKAGE_NAME}" = 'ntp' ]]; then # On centos ntp service is ntpd and on Ubuntu it is ntp. Same is for chrony.
+      adjust_command_to_user_options 'sudo systemctl start ntpd || sudo systemctl start ntp' # Try ntpd, if failed try ntp.
+      adjust_command_to_user_options 'sudo systemctl enable ntpd || sudo systemctl enable ntp'
+    else
+      adjust_command_to_user_options 'sudo systemctl start chronyd || sudo systemctl start chrony'
+      adjust_command_to_user_options 'sudo systemctl enable chronyd || sudo systemctl enable chrony'
+    fi
+  else
+    if [[ "${NTP_PACKAGE_NAME}" = 'ntp' ]]; then # on init system service is named without d at the end of service name.
+      adjust_command_to_user_options 'sudo /etc/init.d/ntp start'
+    else
+      adjust_command_to_user_options 'sudo /etc/init.d/chrony start'
+    fi
+  fi
+}
+
+add_registry_device(){
+  registry_override='n'
+  local registry_location="${1}"
+  if [[ ! -f "${registry_location}" ]]; then
+   adjust_command_to_user_options "sudo mkdir -p ${registry_location}"
+  fi
+  adjust_command_to_user_options "sudo chown quobyte:quobyte ${registry_location}"
+  DEVICE_FILE="${registry_location}/QUOBYTE_DEV_SETUP"
+  if [[ -f "${DEVICE_FILE}" ]];then
+    script_verbose_message "Registry device already present at ${registry_location}. Override it(y/n)?" "user_action"
+    read registry_override
+  else
+    registry_override='y'
+  fi
+  while [[ ! ( "${registry_override}" = 'y' || "${registry_override}" = 'n' ) ]]; do
+    script_verbose_message "Valid options: y or n." 'notify'
+    script_verbose_message "Enter your option(y/n)" "user_action"
+    read registry_override
+  done
+  if [[ "${registry_override}" = 'y'  ]]; then
+    sudo sh -c "echo \"# Quobyte device identifier file\" > ${DEVICE_FILE}"
+    sudo sh -c "echo \"# Created from install_quobyte.sh on $(date)\" >> ${DEVICE_FILE}" >> /dev/null
+    sudo sh -c "echo \"# Hostname: ${HOSTNAME}\" >> ${DEVICE_FILE}" >> /dev/null
+    sudo sh -c "echo \"device.serial=$(uuidgen)\" >> ${DEVICE_FILE}" >> /dev/null
+    sudo sh -c "echo \"device.model=unknown\" >> ${DEVICE_FILE}"
+    sudo sh -c "echo \"device.type=DIR_DEVICE\" >> ${DEVICE_FILE}"
+    if [[ -f "${DEVICE_FILE}" ]];then
+      debug_message "Registry device created at ${DEVICE_FILE}"
+    else
+      script_verbose_message "Failed to create bootstrap device at  ${DEVICE_FILE} " 'notify'
+    fi
+    adjust_command_to_user_options "sudo chown quobyte:quobyte ${DEVICE_FILE}"
+  fi
+}
+
+preprocess_registry_dev(){
+  adjust_command_to_user_options "sudo mkfs.xfs -L quobyte-dev ${REGISTRY_DEV}"
+  adjust_command_to_user_options "sudo mount ${REGISTRY_DEV} ${TEMP_REGISTRY_MOUNT}"
+}
+
+setup_registry_device(){
+  if [[ "${REGISTRY_DEV}" != "" ]]; then
+     sudo mkdir -p "${TEMP_REGISTRY_MOUNT}"
+     preprocess_registry_dev
+     add_registry_device "${TEMP_REGISTRY_MOUNT}"
+  else
+    add_registry_device "${DEFAULT_REGISTRY_LOCATION}"
+  fi
+ }
+
+########################################################################################
+# Utility to check if package installed                                                #
+#   - echos 1 if NOT installed otherwise 0                                            #
+# Used internally to verify dependencies installation.                                 #
+# $(is_software_installed "ntp") NOT to call as normal function as it echos values     #
+########################################################################################
+is_software_installed(){
+   case "${OSName}" in
+    ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME} | ${OPENSUSE_NAME} | ${SLE_NAME})
+        sudo sh -c "sudo rpm -q ${1}" &> /dev/null
+        echo $?
+        return
+      ;;
+   ${UBUNTU_NAME} | ${DEBIAN_NAME})
+    sudo sh -c "sudo dpkg -l ${1}" &> /dev/null
+        echo $?
+        return
+    ;;
+  esac
+}
+
+determine_system_daemon(){
+  local pid="$(ps -e | grep 'systemd$')"
+  if [[ ! -z "${pid}" ]]; then
+    DAEMON_TYPE=systemd
+  else
+    DAEMON_TYPE=non-systemd
+  fi
+}
+
+########################################################################################
+# Starts, stops and restarts quobyte_services                                          #
+#      argument1: start/stop/restart/enable                                            #
+#      argument2: list of commma separated services(ex:registry,metatdata,data)        #
+########################################################################################
+quobyte_services(){
+  IFS=',' read -r -a services_list <<< "${2}"
+  if [[ "${DAEMON_TYPE}" = 'systemd' ]]; then
+    for service_name in "${services_list[@]}"
+    do
+      if [[ "${1}" = 'status' ]]; then
+        printf "  ${service_name}:%s\n" "$(sh -c "sudo systemctl status quobyte-${service_name} 2>&1 |grep -w 'Active:' |  sed 's/.*Active: \?\([a-zA-Z0-9]* [(a-zA-Z0-9)-]*\).*/\1/'")"
+      else
+        adjust_command_to_user_options "sudo systemctl ${1} quobyte-${service_name}"
+      fi
+    done
+    if [[ "${1}" = 'disable' ]]; then
+      adjust_command_to_user_options 'systemctl daemon-reload'
+      adjust_command_to_user_options 'systemctl reset-failed'
+    fi
+  else
+    if [[  "${1}" != 'enable' && "${1}" != 'disable' ]]; then
+      for service_name in "${services_list[@]}"
+      do
+        if [[ "${1}" = 'status' ]]; then
+          echo ''
+          echo "${service_name}:"
+          printf "\n%s\n\n" "$(sh -c "sudo /etc/init.d/quobyte-${service_name} ${1}  2>&1 ")"
+        else
+          adjust_command_to_user_options "sudo /etc/init.d/quobyte-${service_name} ${1}"
+        fi
+      done
+    fi
+  fi
+}
+
+execute_add(){
+  check_software_installation
+  if [[ "${REGISTRY_DEV}" != "" ]]; then
+    validate_registry_device
+  fi
+  script_verbose_message 'Installing dependencies' 'info'
+  install_dependencies
+  check_dependencies
+  script_verbose_message 'Adding Quobyte repository' 'info'
+  add_quobyte_repositories
+  script_verbose_message 'Installing Quobyte software' 'info'
+  if [[ ! -z "$(echo "${services_string}" | grep 'nfs')" ]]; then
+    install_quobyte_software 'server,nfs'
+  else
+    install_quobyte_software 'server'
+  fi
+}
+
+check_dependencies(){
+  if [[ ($(is_software_installed 'ntp') -eq 1 && $(is_software_installed 'chrony') -eq 1 ) ]]; then
+    script_verbose_message 'Required package ntp/chrony is missing' 'notify'
+    exit 1
+  fi
+  if [[  $(is_software_installed 'wget') -eq 1 ]]; then
+    script_verbose_message 'Required package wget is missing' 'notify'
+    exit 1
+  fi
+  # TODO: check java dependcy installation status
+}
+
+check_software_installation(){
+  if [[ $(is_software_installed 'quobyte-server') -eq 0 ]]; then
+    script_verbose_message 'Unable to install quobyte-server. Installation already exists.' 'notify'
+    exit 1
+  fi
+}
+
+validate_registry_device(){
+  if [[ "$(sudo wipefs -p ${REGISTRY_DEV} )" != "" ]]; then
+    script_verbose_message "Quobyte requires unformatted device. The given device ${REGISTRY_DEV} is a formatted device." 'notify'
+    exit 1
+  fi
+}
+
+
+execute_bootstrap(){
+  execute_add
+  script_verbose_message 'Setting up bootstrap node' 'info'
+  setup_registry_device
+  if [[ "${registry_override}" = 'y' ]]; then
+    sudo sh -c "echo \"device.bootstrap=true\" >> ${DEVICE_FILE}"
+  fi
+}
+
+remove_repositories(){
+  case "${OSName}" in
+    ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME})
+      adjust_command_to_user_options 'sudo rm -f /etc/yum.repos.d/quobyte.repo*'
+      adjust_command_to_user_options 'sudo yum-config-manager --disable quobyte*'
+    ;;
+    ${OPENSUSE_NAME} | ${SLE_NAME})
+      adjust_command_to_user_options 'sudo zypper --non-interactive removerepo quobyte*'
+    ;;
+    ${UBUNTU_NAME} | ${DEBIAN_NAME})
+      sed -i '/deb https:\/\/support.quobyte.com/d' /etc/apt/sources.list.d/quobyte.list
+    ;;
+  esac
+}
+
+is_quobyte_installed(){
+  if [[ $(is_software_installed "quobyte-${1}") -eq 0 ]] ; then
+    echo "installed"
+  fi
+}
+
+execute_uninstall(){
+  debug_message 'Uninstallation started'
+  remove_repositories
+  if [[ -z "$(is_quobyte_installed 'server')" && -z "$(is_quobyte_installed 'client')" ]]; then
+    remove_quobyte_directories
+    script_verbose_message 'Quobyte installation not found'
+    exit 0
+  else
+    quobyte_services 'stop' 'registry,data,metadata,api,s3,webconsole,nfs,client'
+    quobyte_services 'disable' 'registry,data,metadata,api,s3,webconsole,nfs,client'
+    debug_message 'Services stopped'
+    remove_quobyte_directories
+    case "${OSName}" in
+      ${CENTOS_NAME} | ${FEDORA_NAME} | ${REDHAT_NAME})
+        adjust_command_to_user_options 'sudo yum remove -y quobyte-server quobyte-client quobyte-nfs'
+      ;;
+      ${OPENSUSE_NAME} | ${SLE_NAME})
+        adjust_command_to_user_options 'sudo zypper --non-interactive remove quobyte-client quobyte-server quobyte-nfs'
+      ;;
+      ${UBUNTU_NAME} | ${DEBIAN_NAME})
+        adjust_command_to_user_options 'sudo apt-get -y remove quobyte-client quobyte-server quobyte-nfs'
+        # Sometimes packages are marked with rc but not removed.
+        # https://linuxprograms.wordpress.com/2010/05/12/remove-packages-marked-rc/
+        adjust_command_to_user_options 'sudo dpkg --list |grep "^rc  quobyte-" | cut -d " " -f 3 | xargs sudo dpkg --purge'
+      ;;
+    esac
+    if [[ -z $(is_quobyte_installed 'server') && -z "$(is_quobyte_installed 'client')" ]]; then
+      script_verbose_message 'Removed quobyte software'
+    else
+      script_verbose_message 'Unable to remove Quobyte software' 'notify'
+      exit 1
+    fi
+    if [[ $? -eq 0 ]]; then
+      script_verbose_message 'Uninstallation completed' 'info'
+    fi
+  fi
+}
+
+remove_quobyte_directories(){
+  adjust_command_to_user_options 'sudo rm -rf /var/log/quobyte'
+  if [[ "${FORCE_UNINSTALL}" = 'yes' ]]; then
+    script_verbose_message 'Removing Quobyte /var/lib/quobyte and /etc/quobyte' 'info'
+    adjust_command_to_user_options "sudo rm -rf /var/lib/quobyte"
+    adjust_command_to_user_options "sudo rm -rf /etc/quobyte"
+  fi
+}
+execute_configure(){
+  script_verbose_message "Adding user ${config_user}"
+  if [[ -z $(is_quobyte_installed 'server')  ]]; then
+    script_verbose_message "'configure' requires Quobyte Server installion." 'notify'
+    exit 1
+  fi
+  local qmgmt_configure_message="$(qmgmt user config add ${config_user} ${email} password ${config_passwd})"
+  if [[ ! -z "$(echo "${qmgmt_configure_message}" | grep 'Success.' )" ]]; then
+    script_verbose_message 'Configuration successful.' 'info'
+  else
+    script_verbose_message "${qmgmt_configure_message}" 'notify'
+  fi
+}
+
+modify_registry_endpoints(){
+  old_registry_string="$(cat /etc/quobyte/host.cfg | grep '^registry=')"
+  if [[ ! -z ${old_registry_string} ]]; then
+    sed -i -e "s/${old_registry_string}/registry=${1}/g" /etc/quobyte/host.cfg
+  else
+    echo "registry=${1}" >> /etc/quobyte/host.cfg
+  fi
+  if [[ ! -z "${qns_id}" ]]; then
+     echo "qns.id=${qns_id}" >> /etc/quobyte/registry.cfg
+  fi
+}
+
+update_host_config(){
+  if [[  ! -z "${registry_endpoints}" ]]; then
+    modify_registry_endpoints "${registry_endpoints}"
+  elif [[  ! -z "${qns_id}" ]]; then
+    modify_registry_endpoints "${qns_id}.myquobyte.net"
+  elif [[ ( -z  "${registry_endpoints}") && ( -z "${qns_id}" ) ]]; then
+    generated_qns_id="$(head -c 8 /dev/urandom | base64 | tr -d '/+=' | tr '[:upper:]' '[:lower:]')"
+    qns_id=${generated_qns_id}
+    debug_message "Generated QNS id: ${generated_qns_id}"
+    modify_registry_endpoints "${generated_qns_id}.myquobyte.net"
+  fi
+}
+
+update_client_config(){
+  local registry_config=''
+  if [[ ! -z ${registry_endpoints} ]]; then
+    registry_config=${registry_endpoints}
+  elif [[ ! -z ${qns_id} ]]; then
+    registry_config="${qns_id}.myquobyte.net"
+  else
+    script_verbose_message 'One of --registry_endpoints or --qns-id is required' 'notify'
+    exit 1
+  fi
+  old_mount_string="$(cat /etc/quobyte/client-service.cfg | grep '^mount_point=')"
+  if [[ ! -z ${old_mount_string} ]]; then
+    sed -i -e "s/${old_mount_string}/mount_point=${CLIENT_MOUNT_POINT}/g" /etc/quobyte/client-service.cfg
+  else
+    echo "mount_point=${CLIENT_MOUNT_POINT}" >> /etc/quobyte/client-service.cfg
+  fi
+
+  old_registry_string="$(cat /etc/quobyte/client-service.cfg | grep '^registry=')"
+  if [[ ! -z ${old_registry_string} ]]; then
+    sed -i -e "s/${old_registry_string}/registry=${registry_config}/g" /etc/quobyte/client-service.cfg
+  else
+    echo "registry=${registry_config}" >> /etc/quobyte/client-service.cfg
+  fi
+
+  client_uuid=$(uuidgen)
+  old_uuid_string="$(cat /etc/quobyte/client-service.cfg | grep '^uuid=')"
+  if [[ ! -z ${old_uuid_string} ]]; then
+    sed -i -e "s/${old_uuid_string}/uuid=${client_uuid}/g" /etc/quobyte/client-service.cfg
+  else
+    echo "uuid=${client_uuid}" >> /etc/quobyte/client-service.cfg
+  fi
+  grep -q "^user_allow_other" /etc/fuse.conf || echo "user_allow_other" >> /etc/fuse.conf
+}
+
+create_client_mount_device(){
+  if [[ ! -d "${CLIENT_MOUNT_POINT}" ]]; then
+    script_verbose_message "Creating client mount point at '${CLIENT_MOUNT_POINT}'" 'info'
+    adjust_command_to_user_options "sudo mkdir -p '${CLIENT_MOUNT_POINT}'"
+  fi
+}
+
+check_client_existence(){
+ if [[ "$(is_software_installed 'quobyte-client')" -eq 0 ]]; then
+   script_verbose_message 'Client already installed on the node' 'notify'
+   exit 1
+ fi
+}
+
+start_and_enable_client_service(){
+  if [[ "${DAEMON_TYPE}" = 'systemd' ]]; then
+    adjust_command_to_user_options "sudo systemctl enable quobyte-client"
+    adjust_command_to_user_options "sudo systemctl start quobyte-client"
+  else
+    adjust_command_to_user_options "sudo mount.quobyte -c /etc/quobyte/client-service.cfg"
+    echo "Client as service not supported on non-systemd platforms."
+    echo "Client needs to be re-mounted after restart"
+  fi
+}
+
+execute_add_client(){
+ install_common_dependencies
+ add_quobyte_repositories
+ install_quobyte_software 'client'
+ create_client_mount_device
+ update_client_config
+ script_verbose_message 'Starting Quobyte client service' 'info'
+ start_and_enable_client_service
+ if [[ "$(is_software_installed 'quobyte-client')" -eq 0 ]];then
+   script_verbose_message 'Added client' 'info'
+ else
+   script_verbose_message 'Failed to add client' 'notify'
+ fi
+}
+
+check_and_init_script_host_path(){
+  if [[ -z ${SCRIPT_HOST_PATH} ]]; then
+    SCRIPT_HOST_PATH=${0}
+  fi
+}
+
+print_time_service_status(){
+  printf "  %s: " ${NTP_PACKAGE_NAME}
+  echo "$(get_time_service_status ${NTP_PACKAGE_NAME})"
+  echo
+}
+
+print_post_bootstrap_instructions(){
+  if [[ -z ${HOST_NAME} ]]; then
+    HOST_NAME=${HOSTNAME}
+  fi
+  check_and_init_script_host_path
+  echo ''
+  echo 'Congratulations! You successfully bootstrapped the first node of your Quobyte cluster.'
+  echo ''
+  if [[ ! -z "${generated_qns_id}" ]]; then
+    echo "Your qns-id is \"${generated_qns_id}\". Please keep it for reference (you can also find it in /etc/quobyte/registry.cfg)."
+    echo ''
+  fi
+  echo 'You can now add more nodes or configure the system.'
+  echo ''
+  echo 'You can add nodes with the following command. Please make sure to select the services that you need:'
+  if [[ ! -z "${generated_qns_id}" ]]; then
+    echo "  ${SCRIPT_HOST_PATH} add --repo-id ${REPO_ID} --services registry,data,metadata --qns-id ${generated_qns_id} [[user@]remote-host]"
+  elif [[ ! -z "${registry_endpoints}" ]]; then
+    echo "  ${SCRIPT_HOST_PATH} add --repo-id ${REPO_ID} --services registry,data,metadata --registry-endpoints ${registry_endpoints} [[user@]remote-host]"
+  fi
+  echo ''
+  echo 'Configure the system with:'
+  echo "  http://${HOST_NAME}:8080"
+  echo ''
+  echo '  or via the command line:'
+  echo "    ${SCRIPT_HOST_PATH} configure --user <user> --password <pass> --email <email> [[user@]remote-host]"
+  echo ''
+}
+
+print_quobyte_exists_instructions(){
+  echo ''
+  script_verbose_message 'Found Quobyte Installation (Server) on node' 'notify'
+  echo 'This script only operates on targets that do not have Quobyte installed yet.'
+  echo ''
+  echo 'Here are some commands that might help you achieve what you want.'
+  echo 'Add additional Quobyte service:'
+  echo '  On Systemd systems:'
+  echo '    sudo systemctl enable quobyte-<service-name>'
+  echo '    sudo systemctl start quobyte-<service-name>'
+  echo ''
+  echo '  On non-systemd systems:'
+  echo '    sudo /etc/init.d/quobyte-<service-name> start'
+  echo ''
+  echo 'Reconfigure registry nodes:'
+  echo '  1. Open /etc/quobyte/host.cfg on respective node'
+  echo "  2. Update 'registry' field with new endpoints"
+  echo '  3. Save and exit'
+  echo ''
+}
+
+########################################################################################
+# If --interactive given, turn on extra-verbose for user input                         #
+#  all commands are adjusted to wait for user input by adjust_command_to_user_options  #
+########################################################################################
+  if [[ ${AUTO_CONFIRM} = 'no'  ]]; then
+    EXTRA_VERBOSE='yes'
+  fi
+
+  determine_system_daemon
+  script_verbose_message 'Determining OS details' 'info'
+  determine_OS_details
+
+########################################################################################
+# Checks for Quobyte Server installation existence                                            #
+########################################################################################
+  if [[  ( ! -z $(is_quobyte_installed 'server') ) && ( "${COMMAND}" = 'add' || "${COMMAND}" = 'bootstrap' )  ]]; then
+    print_quobyte_exists_instructions
+    exit 1
+  fi
+
+########################################################################################
+# @Execute Execute bootstrap, configure,uninstall or add_node etc                      #
+########################################################################################
+  if [[ "${COMMAND}" = 'bootstrap' ]]; then
+    check_repoID
+    execute_bootstrap
+    update_host_config
+    script_verbose_message 'Starting Quobyte services' 'info'
+    if [[ ! -z "$services_string" ]]; then
+      quobyte_service_string="registry,webconsole,api,$services_string"
+    else
+      quobyte_service_string='registry,webconsole,api'
+    fi
+    quobyte_services 'enable' "${quobyte_service_string}"
+    quobyte_services 'start' "${quobyte_service_string}"
+    script_verbose_message 'Services status:' 'info'
+    quobyte_services 'status' "${quobyte_service_string}"
+    print_time_service_status
+    script_verbose_message 'Installation successful.' 'info'
+    if [ "$POST_INSTALL_MSG" == "yes" ]; then
+      print_post_bootstrap_instructions
+    fi
+  elif [[ "${COMMAND}" = 'uninstall' ]]; then
+    execute_uninstall
+  elif [[ "${COMMAND}" = 'add' ]]; then
+    check_repoID
+    execute_add
+    if [[ ( ! -z "$(echo ${services_string}| grep 'registry')" ) && ( ${create_emtpy_registry} = 'yes' ) ]];then
+      setup_registry_device
+    fi
+    update_host_config
+    if [[ ! -z "$services_string" ]]; then
+      script_verbose_message 'Starting Quobyte services' 'info'
+      quobyte_services 'enable' "$services_string"
+      quobyte_services 'start' "$services_string"
+      script_verbose_message 'Services status:' 'info'
+      quobyte_services 'status' "$services_string"
+    else
+      script_verbose_message 'Services status:' 'info'
+    fi
+    print_time_service_status
+    script_verbose_message 'Installation successful.' 'info'
+  elif [[ "${COMMAND}" = 'configure' ]]; then
+    execute_configure
+  elif [[ "${COMMAND}" = 'add-client' ]];then
+    check_client_existence
+    check_repoID
+    script_verbose_message 'Adding client' 'info'
+    execute_add_client
+  else
+    script_verbose_message "Invalid command ${COMMAND}" 'notify'
+    exit 1
+  fi
+fi
