@@ -1,0 +1,21 @@
+---
+- name: bootstrap first node
+  hosts: tag_role_quobootstrap
+  gather_facts: False
+  tasks:
+    - name: copy installer
+      script: files/install_quobyte bootstrap --repo-id Q3NF7R67JK5yF0wEVsTPCpSmbGP7r7G6 --services registry,data,metadata,api,webconsole
+      args:
+        creates: /etc/quobyte
+
+    - name: configure access
+      script: files/install_quobyte configure --user admin --password admin123 --email thomas@willert.dk
+
+    - name: get qns id
+      shell: cat /etc/quobyte/registry.cfg | grep ^qns.id | cut -f2 -d=
+      register: registrycfg
+
+    - set_fact:
+        qns_id: "{{ registrycfg.stdout }}"
+
+    - debug: msg="{{ qns_id }}"
