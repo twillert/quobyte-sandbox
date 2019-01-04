@@ -4,14 +4,15 @@
   gather_facts: False
   vars:
     keypair:	     thomas_internet_home
-    instance_type:   t2.small
+    #instance_type:   t2.small
+    instance_type:   r5.large # 16 GB RAM, 2 vCPU
     security_group: default
     #image:	     ami-194cdc76	# RHEL 7.4
     image:	     ami-dd3c0f36	# CENTOS 7
     #image:       ami-0cfbf4f6db41068ac # Amazon Linux
     region:	     eu-central-1
     zone:        eu-central-1b
-    count:           1
+    count:           4
     owner:           thomas
     role:            quonode
   tasks:
@@ -80,7 +81,10 @@
              volume_type: gp2
              volume_size: 100
              delete_on_termination: true
-
+           - device_name: /dev/sdc
+             volume_type: gp2
+             volume_size: 10
+             delete_on_termination: true
       register: ec2
 
     - name: Add new instance to host group
